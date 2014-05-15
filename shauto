@@ -1,0 +1,273 @@
+#!/bin/bash
+#
+#auto_shell.sh
+#批量维护工具
+
+
+#引用未定义的变量时报错并退出脚本
+set -o nounset
+#命令执行失败时报错并退出脚本
+#set -o errexit
+
+#当前绝对路径
+PWD_REAL="$(cd $(dirname $0);pwd)"
+#要执行命令的主机列表
+HOSTLIST=""
+#用户及端口
+USER="root"
+PORT=22
+#要执行的命令
+CMD=""
+#定制ssh连接选项
+SSH_ARGS="-o StrictHostKeyChecking=no"
+#并发数量
+PARALL=1
+#远程SHELL
+REMOTE_SHELL="bash"
+#临时目录
+TEMP_DIR="/tmp/$(basename $0)_temp_dir"
+#冗余模式
+VERBOSE=""
+#当前时间
+#DATE="$(date +%Y%m%d%H%M%S)"
+
+
+usage() {
+    :
+}
+
+
+success() {
+    echo -e "\033[32m$@\033[0m"
+}
+
+
+failed() {
+    echo -e "\033[31m$@\033[0m" >&2
+}
+
+
+error() {
+    echo -e "\033[31m$@\033[0m" >&2
+    exit 1
+}
+
+
+#检查命令返回值，判断命令是否成功执行
+return_code_check() {
+    if [[ "$?" -eq 0 ]]; then
+        echo "$@ success!"
+    else
+        error "$@ failed!"
+    fi
+}
+
+
+#创建临时目录
+create_temp() {
+    [[ -d "$TEMP_DIR" ]] && rm -rf "$TEMP_DIR" &>/dev/null
+    mkdir -m 700 $TEMP_DIR
+}
+
+
+scp_file() {
+    :
+}
+
+ssh_cmd() {
+    local host="$1"
+    local temp_file="${TEMP_DIR}/${host}"
+
+    echo "$CMD" | ssh -l "$USER" -p "$PORT" "$SSH_ARGS" "$host" "$REMOTE_SHELL" &>"$temp_file"
+    if [[ "$?" -eq 0 ]]; then
+        if [[ -n "$VERBOSE" ]]; then
+            sed "s/^/$host: /" "$temp_file"
+        else
+            success "$host: success"
+        fi
+    else
+        if [[ -n "$VERBOSE" ]]; then
+            cat "$temp_file"
+        else
+            failed "$host: failed"
+        fi
+    fi   
+}
+
+
+parall_run() {
+    #建立命名管道文件，为了不受干扰，将文件打开，将文件inode信息删除
+    local pipe="$(mktemp -u)" 
+    mkfifo "$pipe" 
+    #将文件$pipe绑定到文件描述符5 
+    exec 5<>"$pipe"
+    rm -f "$pipe" 
+
+    #往命名管道存入值，存入多少个值就表示并发量多大
+    for ((i=1;i<=${PARALL};i++)); do 
+        echo >&5
+    done 
+  
+    for host in $HOSTLIST; do
+        #从命名管道读取一个值
+        #如果此时命名管道中没有值，read会阻塞直到读取到一个值  
+        read -u 5
+        #执行具体的动作action，执行完后放入一个值到命名管道
+        (ssh_cmd "$host"; echo >&5) &
+    done
+
+    #等待所有后台进程执行完毕
+    wait 
+    #关闭文件描述符5
+    exec 5>&-
+}
+
+
+
+#获取命令的绝对路径
+#Arguments:
+#  $1: 传入命令名
+#Returns:
+#  传入命令的绝对路径
+get_cmd_abspath() {
+    local cmd="$1"
+
+    if which "$cmd" &>/dev/null; then
+        echo "$(which $cmd)"
+        return 0
+    else
+        error "no $cmd in ($PATH)"
+    fi
+}
+
+
+#管理远程主机文件/目录的属性
+#Arguments:
+#  $1：远程文件/目录路径jj
+#  $2：属主(owner)
+#  $3：属组(group)
+#  $4: 文件权限
+file() {
+    local path="$1"
+    local owner="$2"
+    local group="$3"
+    local mode="$4"
+}
+
+
+#复制本地文件/目录到远程主机
+#Arguments:
+#  $1: 文件在本地主机的路径
+#  $2: 文件在远程主机的存放路径
+#  $3: 
+copy() {
+    local src="$1"
+    local dest="$2"
+    scp $src $user@$host:$dest
+    # 如果目的路径在其他用户下怎么办
+    # 先copy到$user下一个临时目录
+    # 然后再sudo cp到对应目录
+}
+
+
+parse_arguments() {
+    while [[ -n "${1:-}" ]]; do
+        case "$1" in
+        -h)
+            while [[ -n "$2" && "${2#-}" == "$2" ]]; do
+                HOSTLIST="$2
+$HOSTLIST"
+                shift
+            done
+            shift
+            ;;
+        -H)
+            while [[ -n "$2" && "${2#-}" == "$2" ]]; do
+                local hostfile="$2"
+                [[ -f "$hostfile" ]] && error "Host file '$hostfile' does not exist!"
+                HOSTLIST="$(cat $hostfile | sed 's/#.*//' | egrep -v "^ *$")
+$HOSTLIST"
+                shift
+            done
+            shift
+            ;;
+        -u)
+            USER="$2"
+            shift 2
+            ;;
+        -p)
+            PORT="$2"
+            shift 2
+            ;;
+        -c)
+            CMD="$CMD
+$2"
+            shift 2
+            ;;
+        -C)
+            #可以同时执行多个文件
+            while [[ -n "$2" && "${2#-}" == "$2" ]]; do
+                local scriptfile="$2"
+                [[ -f "$scriptfile" ]] || error "Script File $scriptfile does not exist!"
+                CMD="$CMD
+$(cat $scriptfile)"
+                shift
+            done
+            shift
+            ;;
+        -o)
+            SSH_ARGS="$SSH_ARGS -o $2"
+            shift 2
+            ;;
+        -s)
+            REMOTE_SHELL="$2"
+            shift 2
+            ;;
+        -f)
+            PARALL="$2"
+            shift 2
+            ;;
+        -t)
+            if [[ -n "$2" && "${2#-}" == "$2" ]]; then
+                local ssh_timeout="$2"
+            fi
+            SSH_ARGS="$SSH_ARGS -o ConnectTimeout=$ssh_timeout"
+            shift 2
+            ;;
+        -v)
+            VERBOSE="verbose"
+            shift
+            ;;
+        --help)
+            usage
+            exit
+            ;;
+        *)
+            echo "invalid command - \"$1\"" 1>&2
+            usage
+            exit 1
+            ;;
+        esac
+    done
+}
+
+
+main() {
+    #解析命令行参数
+    parse_arguments "$@"
+
+    #至少要指定一个host
+    [[ -z "$HOSTLIST" ]] && error "No host found, please use -h/-H specify at least one host"
+    #至少要存在一个命令
+    #[[ -z "$CMD" ]] && error "No command found, please use -c/-C specify at least one command"
+
+    #创建临时目录
+    create_temp
+
+    #开始执行, parall_run "ssh_cmd", eval "ssh_cmd"
+    parall_run
+}
+
+
+main "$@"
+
