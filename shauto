@@ -105,10 +105,18 @@ usage() {
 Usage: $(basename $0) <host-pattern> [option]...
 
 Options:
-  -a
-  -m
-  -u
-  -p
+  -m <module>             指定要执行的模块
+  -a <module_args>        模块参数
+  -b <batch_file>         执行批量脚本文件
+  -h <hosts_file>         指定hosts文件路径
+  -u <user>               ssh用户
+  -p <port>               ssh端口
+  -s <shell>              远程主机shell
+  -i <private_key_file>   私钥路径
+  -f <forks>              并发数
+  -o <ssh_args>           ssh连接选项
+  -t <ssh_timeout>        ssh连接超时时间
+  -v <verbose_mode>       更详细的输出
 EOF
     
     exit 1
