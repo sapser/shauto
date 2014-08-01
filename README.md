@@ -1,4 +1,5 @@
 ### shauto
+------
 bash写的批量执行工具，模拟python的ansible库。
 
 简单示例：
@@ -79,6 +80,7 @@ TASK - command: ls /root/
 ```
 
 ### 安装及使用
+------
 shauto就一个单独的shell脚本，可以放在`PATH`下，也可以放在任意路径然后通过绝对或相对路径调用，记得要给可执行权限。
 
 shauto脚本开头有一些全局变量需要自定义，可以根据实际情况修改：
@@ -117,7 +119,8 @@ FORKS=5
 
 
 ### ssh远程连接
-shauto使用openssh来连接远程主机，使用rsync来传输文件，对私钥验证支持比较好，因为可以通过`ssh-agent`来自动填私钥密码，在`~/.bashrc`中添加这一段代码，可以永久使用`ssh-agent`，而不会因为终端推出被干掉：
+------
+shauto使用openssh来连接远程主机，使用rsync来传输文件，对私钥验证支持比较好，因为可以通过`ssh-agent`来自动填私钥密码，在`~/.bashrc`中添加这一段代码，可以永久使用`ssh-agent`，而不会因为终端退出被干掉：
 ```bash
 if [ -f ~/.agent.env ]; then
         . ~/.agent.env >/dev/null
@@ -135,6 +138,7 @@ fi
 
 
 ### TODO
+------
 - `sudo`模块在命令行用有bug
 - `copy`模块越写越复杂，需要简化
 - 添加更多模块
