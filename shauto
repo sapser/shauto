@@ -170,24 +170,26 @@ result_check() {
 
 #解析hosts文件
 hostfile_parse() {
+    local match_hosts= host=
+
+    #文件存在
     [[ -f "$HOSTS_FILE" ]] || error "$HOSTS_FILE does not exist!"
 
+    #匹配组
     if grep "^\[$PATTERN\]" "$HOSTS_FILE" &>/dev/null; then
-        #匹配组
-        local match_hosts="$(sed -n "/^\[$PATTERN\]/,/^\[/p" "$HOSTS_FILE" | sed '/^\[/d' | sed '/^#/d' | sort | uniq)"
-        local host=""
+        #获取该组下所有主机
+        match_hosts="$(sed -n "/^\[$PATTERN\]/,/^\[/p" "$HOSTS_FILE" | sed '/^\[/d' | sed '/^#/d' | sort | uniq)"
         for host in $match_hosts; do
-            #向数组添加元素
+            #添加要执行的主机到HOSTLIST数组中
             HOSTLIST+=("$host")
         done
+    #匹配单个IP
     elif [[ "$PATTERN" =~ ^[1-9][0-9]*\.[0-9]+\.[0-9]+\.[0-9]+$ ]] \
         && grep "^$PATTERN" "$HOSTS_FILE" &>/dev/null; then
-        #匹配单个IP
         HOSTLIST+=("$PATTERN")
+    #匹配所有主机
     elif [[ "$PATTERN" == "all" || "$PATTERN" == "*" ]]; then
-        #匹配所有主机
-        local match_hosts="$(grep '^[1-9]' "$HOSTS_FILE" | sort | uniq)"
-        local host=""
+        match_hosts="$(grep '^[1-9]' "$HOSTS_FILE" | sort | uniq)"
         for host in $match_hosts; do
             HOSTLIST+=("$host")
         done
@@ -201,7 +203,7 @@ hostfile_parse() {
 remote_cmd() {
     local host="$1"
     local quiet="${2:-no}"
-    local private_key=""
+    local private_key=
 
     if [[ -n "$PRIVATE_KEY_FILE" ]]; then
         private_key="-i $PRIVATE_KEY_FILE"
@@ -244,7 +246,7 @@ local_cmd() {
 #传输命令文件到远程主机
 scp_file() {
     local host="$1"
-    local private_key=""
+    local private_key=
 
     if [[ -n "$PRIVATE_KEY_FILE" ]]; then
         private_key="-i $PRIVATE_KEY_FILE"
@@ -266,7 +268,7 @@ parall_run() {
     local module="${1:-remote_cmd}"
     shift
 
-    #建立命名管道文件，为了不受干扰，将文件打开，将文件inode信息删除
+    #建立命名管道文件
     local pipe="$(mktemp -u)" 
     mkfifo "$pipe" 
     #将文件$pipe绑定到文件描述符5 
@@ -288,8 +290,10 @@ parall_run() {
 
     #等待所有后台进程执行完毕
     wait 
+
     #美化输出，TASK间以一个空行分割
     #[[ "$module" != "scp_file" ]] && echo && echo >> "$LOG_FILE"
+
     #关闭文件描述符5
     exec 5>&-
 }
@@ -307,8 +311,7 @@ parall_run() {
 #  -m module: 以sudo执行的模块名
 #  -a module_args: 模块参数
 sudo() {
-    local module=""
-    local module_args=""
+    local module= module_args=
 
     while getopts :m:a:u:x: option; do
         case "$option" in
@@ -344,8 +347,10 @@ sudo() {
 #在远程主机上执行指定命令
 #Usage: command "cmd..."
 command() {
+    #$1为空
     [[ -z "${1:-}" ]] && error "command: must provide one command to execute"
 
+    #构造命令文件
     cat <<EOF > "$CMD_FILE"
 set -o errexit
 $@ 
@@ -362,7 +367,7 @@ EOF
 #检查远程主机是否存活
 #Usage: ping
 ping() {
-    local ping_cmd=""
+    local ping_cmd=
 
     if which fping &>/dev/null; then
         ping_cmd="$(which fping)"
@@ -390,8 +395,9 @@ EOF
 file() {
     local owner="$REMOTE_USER"
     local group="$owner"
-    local mode=""
-    local recursive=""
+    local mode= 
+    local recursive=
+    local cmd=
 
     while getopts :u:g:m:rR option; do
         case "$option" in
@@ -411,7 +417,6 @@ file() {
     [[ -n "$1" ]] || error "file: must specify a path"
 
     #命令构造
-    local cmd=""
     if [[ -n "$mode" ]]; then
         cmd="chmod $recursive $mode $@"
     fi
@@ -437,11 +442,11 @@ EOF
 #  -b: 先将目的文件备份再覆盖(备份时会加上一个时间戳)，默认不会备份目的文件
 #  -f: 如果目的文件存在则不会覆盖，默认不管目的文件存不存在都会覆盖
 copy() {
-    local src=""
-    local dest=""
+    local src=
+    local dest=
     local backup="no"
     local force="yes"
-    local private_key=""
+    local private_key=
 
     while getopts :s:d:bf option; do
         case "$option" in
@@ -458,11 +463,7 @@ copy() {
     unset OPTIND
 
     [[ -z "$src" || -z "$dest" ]] && error "copy: must provide the -s and -d options"
-    if [[ -e "$src" ]]; then
-        :
-    else
-        error "copy: $src does not exist"
-    fi
+    [[ -e "$src" ]] || error "copy: $src does not exist"
 
     echo "TASK - copy: $src -> $dest" | tee -a "$LOG_FILE"
 
@@ -598,9 +599,7 @@ main() {
     echo "=== $DATE ===" >> "$LOG_FILE"
 
     if [[ -n "$BATCH_FILE" ]]; then
-        if [[ ! -f "$BATCH_FILE" ]]; then
-            error "$BATCH_FILE does not exist!"
-        fi
+        [[ -f "$BATCH_FILE" ]] || error "$BATCH_FILE does not exist!"
         #执行脚本
         . "$BATCH_FILE"
     elif [[ -n "$MODULE" ]]; then
