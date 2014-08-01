@@ -1,54 +1,104 @@
 #!/bin/bash
 #
-#shell运维自动化工具
-
+#shell自动化运维工具
 
 #引用未定义的变量时报错并退出脚本
 set -o nounset
 #命令执行失败时报错并退出脚本
 #set -o errexit
 
-#脚本所在目录的绝对路径
-SCRIPT_DIR="$(cd $(dirname $0);pwd)"
-#脚本绝对路径
-SCRIPT_PATH="${SCRIPT_DIR}/$(basename $0)"
-#hosts文件默认路径
-HOSTS_FILE="hosts"
-#临时保存数据目录
-TEMP_DIR="/tmp/$(basename $0)_temp_dir"
 
-#要执行的模块
-MODULE=""
-#模块参数
-MODULE_ARGS=""
-#执行自定义脚本文件
-BATCH_FILE=""
+############################
+#     可自定义全局变量     #
+############################
+#
+#hosts文件路径
+HOSTS_FILE="hosts"
+
+#日志文件路径
+LOG_FILE="$(basename $0).log"
 
 #远程ssh用户
 REMOTE_USER="chenwei" 
+
 #远程ssh端口
 REMOTE_PORT=22
+
 #远程shell
-REMOTE_SHELL="bash"
-#私钥
+REMOTE_SHELL="/bin/sh"
+
+#sudo到哪个用户
+SUDO_USER="root"
+
+#sudo命令参数
+SUDO_ARGS="-H"
+
+#私钥文件路径
 PRIVATE_KEY_FILE=""
+
 #ssh连接超时时间
-TIMEOUT=10
-#ssh连接选项
-#SSH_ARGS="-o StrictHostKeyChecking=no -o ConnectTimeout=${TIMEOUT}"
-SSH_ARGS="-o StrictHostKeyChecking=no"
+SSH_TIMEOUT=10
+
 #并发数量
 FORKS=5
 
-#要执行命令的主机列表
-HOSTLIST=()
+
+################################
+#     以下部分不可手动修改     #
+################################
+#
+#任务开始执行时间
+DATE="$(date +'%Y%m%d%H%M%S')"
+
+#本地存放临时文件目录
+TEMP_DIR="${HOME}/.$(basename $0)/${DATE}"
+
+#命令文件
+CMD_FILE="${TEMP_DIR}/cmd.sh"
+
+#远程主机存放临时文件目录
+REMOTE_TEMP_DIR="/home/${REMOTE_USER}/.$(basename $0)/${DATE}"
+
+#远程命令文件
+REMOTE_CMD_FILE="${REMOTE_TEMP_DIR}/cmd.sh"
+
+#ssh连接选项
+#StrictHostKeyChecking=no不会检查~/.ssh/known_hosts文件
+#UserKnownHostsFile=/dev/null不记录信息到~/.ssh/known_hosts文件
+SSH_ARGS="-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null"
+
+#sudo执行命令时为ssh连接分配伪终端
+ALLOC_TTY="-T"
+
+#sudo完整命令
+SUDO_CMD=""
+
 #主机匹配模式
 PATTERN=""
+
+#要执行命令的主机列表
+HOSTLIST=()
+
 #要执行的命令
-CMDLIST="set -o errexit"
+CMDLIST=""
+
+#要执行的模块
+MODULE=""
+
+#模块参数
+MODULE_ARGS=""
+
+#自定义脚本路径
+BATCH_FILE=""
+
 #冗余模式
 VERBOSE=""
 
+
+
+###############################################
+#                 功 能 函 数                 #
+###############################################
 
 usage() {
     cat <<EOF
@@ -67,11 +117,13 @@ EOF
 
 success() {
     echo -e "\033[32m$@\033[0m"
+    echo "$@" >> "$LOG_FILE"
 }
 
 
 failed() {
     echo -e "\033[31m$@\033[0m" >&2
+    echo -e "$@" >> "$LOG_FILE"
 }
 
 
@@ -81,15 +133,30 @@ error() {
 }
 
 
-#创建临时目录，保存执行结果
-create_temp_dir() {
-    [[ -d "$TEMP_DIR" ]] && rm -rf "$TEMP_DIR" &>/dev/null
-    mkdir -m 700 $TEMP_DIR
+#创建本地临时目录，保存模块执行结果
+create_local_temp_dir() {
+    local temp_dir="${TEMP_DIR%%/20*}"
+    [[ -d "$temp_dir" ]] && rm -rf "${temp_dir}"/20* &>/dev/null
+    mkdir -p $TEMP_DIR
 }
 
 
-hostfile_check() {
-    :
+#检查模块执行结果
+result_check() {
+    local rc="$1"
+    local host="$2"
+
+    if [[ "$rc" -eq 0 ]]; then
+        if [[ -n "$VERBOSE" ]]; then
+            success "$host | success | rc=0 >>"
+            awk '{print "\033[32m"host":\033[0m "$0;print host": "$0 >>"'$LOG_FILE'"}' \
+                host="$host" "${TEMP_DIR}/${host}.success"
+        else
+            success "$host | success | rc=0"
+        fi
+    else
+        failed "$host | failed | rc=${rc} >>\n$(cat ${TEMP_DIR}/${host}.failed)"
+    fi
 }
 
 
@@ -97,12 +164,9 @@ hostfile_check() {
 hostfile_parse() {
     [[ -f "$HOSTS_FILE" ]] || error "$HOSTS_FILE does not exist!"
 
-    #hostfile语法检测
-    #hostfile_check
-
     if grep "^\[$PATTERN\]" "$HOSTS_FILE" &>/dev/null; then
         #匹配组
-        local match_hosts="$(sed -n "/^\[$PATTERN\]/,/^\[/p" "$HOSTS_FILE" | sed '/^\[/d' | sort | uniq)"
+        local match_hosts="$(sed -n "/^\[$PATTERN\]/,/^\[/p" "$HOSTS_FILE" | sed '/^\[/d' | sed '/^#/d' | sort | uniq)"
         local host=""
         for host in $match_hosts; do
             #向数组添加元素
@@ -125,73 +189,74 @@ hostfile_parse() {
 }
 
 
-#管理文件/目录属性
-#Usage: attrib [option]... path
-#Options:
-#  -u owner: 属主，可选，默认值"$REMOTE_USER"
-#  -g group: 属组，可选，默认值"$REMOTE_USER"
-#  -m mode: 权限，可选，默认值"0644"
-#  -r/-R: 是否递归处理目录，可选，默认不递归处理目录
-attrib() {
-    local owner="$REMOTE_USER"
-    local group="$owner"
-    local mode="0644"
-    local recursive=""
-
-    while getopts :u:g:m:rR option; do
-        case "$option" in
-            u) owner="$OPTARG";;
-            g) group="$OPTARG";;
-            m) mode="$OPTARG";;
-            r|R) recursive="-R";;
-            \?) error "attrib: invalid option -${OPTARG}";;
-            \:) error "attrib: must provide a value for -${OPTARG} option";;
-        esac
-    done
-    #处理完选项，$1变为非选项参数
-    shift $(($OPTIND - 1)) 
-    unset OPTIND
-
-    [[ -n "$1" ]] || error "attrib: must specify a path"
-    CMDLIST="$CMDLIST
-chmod $recursive $mode $@ && chown $recursive ${owner}:${group} $@"
-}
-
-
-#传输文件/目录到远程主机
-scp_file() {
-    :
-}
-
-
-#连接远程主机并执行命令
-ssh_cmd() {
+#在远程主机执行命令
+remote_cmd() {
     local host="$1"
-    local temp_file_success="${TEMP_DIR}/${host}.success"
-    local temp_file_failed="${TEMP_DIR}/${host}.failed"
+    local quiet="${2:-no}"
+    local private_key=""
 
-    echo "$CMDLIST" | 
-    ssh -l "$REMOTE_USER" -p "$REMOTE_PORT" "$SSH_ARGS" "$host" "$REMOTE_SHELL" \
-        >>"$temp_file_success" 2>>"$temp_file_failed"
+    if [[ -n "$PRIVATE_KEY_FILE" ]]; then
+        private_key="-i $PRIVATE_KEY_FILE"
+    fi
 
-    rc="$?"
-    if [[ "$rc" -eq 0 ]]; then
-        if [[ -n "$VERBOSE" ]]; then
-            #success "$host | success | rc=0 >>"
-            tail -100 "$temp_file_success" | \
-            awk -v host="$host" '{print "\033[32m1"host"\033[0m: "$0}'
-        else
-            success "$host | success | rc=0"
-        fi
+    #远程主机上执行命令文件
+    #ssh -t host sudo cmd和ssh -tt host sudo cmd在后端执行各种报错
+    #通过ssh -tt host "sudo cmd"解决
+    ssh $ALLOC_TTY -l $REMOTE_USER -p $REMOTE_PORT $private_key $SSH_ARGS \
+        $host "$SUDO_CMD $REMOTE_SHELL $REMOTE_CMD_FILE" \
+        >"${TEMP_DIR}/${host}.success" 2>"${TEMP_DIR}/${host}.failed"
+
+    #检查ssh执行结果
+    local rc="$?"
+    if [[ "$quiet" == "yes" ]]; then
+        [[ "$rc" -ne 0 ]] && failed "$host: $(cat ${TEMP_DIR}/${host}.failed)"
     else
-        failed "$host | failed | rc=${rc} >>\n$(cat $temp_file_failed)"
-    fi   
+        result_check "$rc" "$host"
+    fi
+}
+
+
+#在本地执行命令
+local_cmd() {
+    local host="$1"
+    local quiet="${2:-no}"
+
+    /bin/sh $CMD_FILE "$host" >"${TEMP_DIR}/${host}.success" 2>"${TEMP_DIR}/${host}.failed"
+
+    #检查ssh执行结果
+    local rc="$?"
+    if [[ "$quiet" == "yes" ]]; then
+        [[ "$rc" -ne 0 ]] && failed "$host: $(cat ${TEMP_DIR}/${host}.failed)"
+    else
+        result_check "$rc" "$host"
+    fi
+}
+
+
+#传输命令文件到远程主机
+scp_file() {
+    local host="$1"
+    local private_key=""
+
+    if [[ -n "$PRIVATE_KEY_FILE" ]]; then
+        private_key="-i $PRIVATE_KEY_FILE"
+    fi
+
+    rsync -az --delete --progress \
+        -e "ssh -l $REMOTE_USER -p $REMOTE_PORT $private_key $SSH_ARGS" \
+        "${TEMP_DIR%%/20*}/" "$host":"${REMOTE_TEMP_DIR%%/20*}/" \
+        >/dev/null 2>"${TEMP_DIR}/${host}.failed"
+
+    if [[ "$?" -ne 0 ]]; then
+        failed "$host: $(cat ${TEMP_DIR}/${host}.failed)"
+    fi
 }
 
 
 #并发控制
 parall_run() {
-    local module="${1:-ssh_cmd}"
+    local module="${1:-remote_cmd}"
+    shift
 
     #建立命名管道文件，为了不受干扰，将文件打开，将文件inode信息删除
     local pipe="$(mktemp -u)" 
@@ -204,28 +269,252 @@ parall_run() {
     for ((i=1;i<=${FORKS};i++)); do 
         echo >&5
     done 
-  
+    
     for host in ${HOSTLIST[@]}; do
         #从命名管道读取一个值
         #如果此时命名管道中没有值，read会阻塞直到读取到一个值  
         read -u 5
-        #执行具体的动作，执行完后放入一个值到命名管道
-        ($module "$host"; echo >&5) &
+        #执行具体的模块，执行完后放入一个值到命名管道
+        ($module "$host" "$@"; echo >&5) &
     done
 
     #等待所有后台进程执行完毕
     wait 
+    #美化输出，TASK间以一个空行分割
+    #[[ "$module" != "scp_file" ]] && echo && echo >> "$LOG_FILE"
     #关闭文件描述符5
     exec 5>&-
 }
 
 
+#####################################
+#            模 块 列 表            #
+#####################################
+
+#在远程主机上sudo执行
+#sudo [-u sudo_user] [-x sudo_args] -m module -a "module_args"
+#options:
+#  -u sudo_user: 指定sudo哪个用户
+#  -x sudo_args: 指定sudo命令参数
+#  -m module: 以sudo执行的模块名
+#  -a module_args: 模块参数
+sudo() {
+    local module=""
+    local module_args=""
+
+    while getopts :m:a:u:x: option; do
+        case "$option" in
+            m) module="$OPTARG";;
+            a) module_args="$OPTARG";;
+            u) SUDO_USER="$OPTARG";;
+            x) SUDO_ARGS="$OPTARG";;
+            \?) error "sudo: invalid option -${OPTARG}";;
+            \:) error "sudo: must provide a value for -${OPTARG} option";;
+        esac
+    done
+    #处理完选项，$1变为非选项参数
+    shift $(($OPTIND - 1)) 
+    unset OPTIND
+
+    if [[ -z "$module" || -z "$module_args" ]]; then
+        error "sudo: must provide the -m and -a options"
+    fi
+
+    #使用sudo时要为ssh连接分配一个伪终端，不然报错
+    ALLOC_TTY="-tt"
+    SUDO_CMD="sudo -u $SUDO_USER $SUDO_ARGS"
+
+    #执行模块
+    $module $module_args
+    
+    #执行完将全局变量还原，不然会影响下一个模块执行
+    ALLOC_TTY="-T"
+    SUDO_CMD=""
+}
+
+
+#在远程主机上执行指定命令
+#Usage: command "cmd..."
+command() {
+    [[ -z "${1:-}" ]] && error "command: must provide one command to execute"
+
+    cat <<EOF > "$CMD_FILE"
+set -o errexit
+$@ 
+EOF
+
+    echo "TASK - command: $@" | tee -a "$LOG_FILE"
+    #传输命令文件
+    parall_run scp_file
+    #远程执行命令文件
+    parall_run
+}
+
+
+#检查远程主机是否存活
+#Usage: ping
+ping() {
+    local ping_cmd=""
+
+    if which fping &>/dev/null; then
+        ping_cmd="$(which fping)"
+    else
+        ping_cmd="$(which ping) -c 4 -q"
+    fi
+
+    cat <<EOF >"$CMD_FILE"
+$ping_cmd \$1
+EOF
+
+    echo "TASK - ping" | tee -a "$LOG_FILE"
+    #批量执行
+    parall_run local_cmd
+}
+
+
+#管理文件/目录属性
+#Usage: file [option]... path
+#Options:
+#  -u owner: 属主，可选，默认值同"$REMOTE_USER"全局变量
+#  -g group: 属组，可选，默认值同"$REMOTE_USER"全局变量
+#  -m mode: 权限，可选，默认不处理文件权限
+#  -r/-R: 是否递归处理目录，可选，默认不递归处理目录
+file() {
+    local owner="$REMOTE_USER"
+    local group="$owner"
+    local mode=""
+    local recursive=""
+
+    while getopts :u:g:m:rR option; do
+        case "$option" in
+            u) owner="$OPTARG";;
+            g) group="$OPTARG";;
+            m) mode="$OPTARG";;
+            r|R) recursive="-R";;
+            \?) error "file: invalid option -${OPTARG}";;
+            \:) error "file: must provide a value for -${OPTARG} option";;
+        esac
+    done
+    #处理完选项，$1变为非选项参数
+    shift $(($OPTIND - 1)) 
+    unset OPTIND
+
+    #至少要指定一个路径
+    [[ -n "$1" ]] || error "file: must specify a path"
+
+    #命令构造
+    local cmd=""
+    if [[ -n "$mode" ]]; then
+        cmd="chmod $recursive $mode $@"
+    fi
+    cat <<EOF >"$CMD_FILE"
+set -o errexit
+chown $recursive ${owner}:${group} $@
+$cmd
+EOF
+
+    echo "TASK - file: $@" | tee -a "$LOG_FILE"
+    #传输命令文件
+    parall_run scp_file
+    #远程执行命令文件
+    parall_run
+}
+
+
+#传输文件/目录到远程主机
+#Usage: copy [-bf] -s source_path -d destination_path
+#Options:
+#  -s path: 源文件路径
+#  -d path: 远程主机上的目的路径
+#  -b: 先将目的文件备份再覆盖(备份时会加上一个时间戳)，默认不会备份目的文件
+#  -f: 如果目的文件存在则不会覆盖，默认不管目的文件存不存在都会覆盖
+copy() {
+    local src=""
+    local dest=""
+    local backup="no"
+    local force="yes"
+    local private_key=""
+
+    while getopts :s:d:bf option; do
+        case "$option" in
+            s) src="$OPTARG";;
+            d) dest="$OPTARG";;
+            b) backup="yes";;
+            f) force="no";;
+            \?) error "copy: invalid option -${OPTARG}";;
+            \:) error "copy: must provide a value for -${OPTARG} option";;
+        esac
+    done
+    #处理完选项，$1变为非选项参数
+    shift $(($OPTIND - 1)) 
+    unset OPTIND
+
+    [[ -z "$src" || -z "$dest" ]] && error "copy: must provide the -s and -d options"
+    if [[ -e "$src" ]]; then
+        :
+    else
+        error "copy: $src does not exist"
+    fi
+
+    echo "TASK - copy: $src -> $dest" | tee -a "$LOG_FILE"
+
+    #在远程主机执行的命令
+    cat <<EOF >"$CMD_FILE"
+set -o errexit
+
+if [[ "$backup" == "yes" ]]; then
+    #目的路径是一个目录，且目录末尾有/
+    if [[ -d "$dest" && "${dest%/}" != "$dest" ]]; then
+        :
+    else
+        mv "$dest" "${dest}_\$(date +%Y%m%d%H%M%S)"
+    fi
+fi
+
+mv "${REMOTE_TEMP_DIR}/\$(basename $src)" "$dest"
+EOF
+    #先把命令文件传到远程主机，也用于保证远程主机临时目录一定存在
+    parall_run scp_file
+
+    if [[ -n "$PRIVATE_KEY_FILE" ]]; then
+        private_key="-i $PRIVATE_KEY_FILE"
+    fi
+    #在本地执行的命令
+    #把文件放到远程主机$REMOTE_TEMP_DIR下，然后再move到对应位置
+    cat <<EOF >"$CMD_FILE"
+rsync -az --progress \\
+    -e "ssh -l $REMOTE_USER -p $REMOTE_PORT $private_key $SSH_ARGS" \\
+    "$src" \$1:"${REMOTE_TEMP_DIR}/"
+EOF
+    parall_run local_cmd yes
+
+    #执行远程主机命令文件
+    parall_run
+}
+
+
+#通过yum包管理工具安装rpm包
+#Usage：yum []
+#--nogpgcheck
+yum() {
+    cat <<EOF >"$CMD_FILE"
+set -o errexit
+yum -y install $pkg
+EOF
+}
+
+########################
+#     模块列表结束     #
+########################
+
+
+#解析命令行参数
 cmdline_arguments_parse() {
     if [[ "$#" -lt 3 ]]; then
         usage
     fi
 
-    #第一个参数必须为匹配模式字符串
+    #第一个参数必须为模式字符串
     if [[ -n "$1" && "${1#-}" == "$1" ]]; then
         PATTERN="$1"
         shift
@@ -233,14 +522,13 @@ cmdline_arguments_parse() {
         usage
     fi
 
-    while getopts :m:a:b:h:u:p:s:i:f:o:v option; do
+    while getopts :m:a:b:h:u:p:s:i:f:o:t:v option; do
         case "$option" in
         m)
             MODULE="$OPTARG"
             ;;
         a)
             MODULE_ARGS="$OPTARG"
-            #MODULE_ARGS+=($OPTARG)
             ;;
         b)
             BATCH_FILE="$OPTARG"
@@ -266,6 +554,9 @@ cmdline_arguments_parse() {
         o)
             SSH_ARGS="$SSH_ARGS -o $OPTARG"
             ;;
+        t)
+            SSH_TIMEOUT="$OPTARG"
+            ;;
         v)
             VERBOSE="yes"
             ;;
@@ -281,34 +572,9 @@ cmdline_arguments_parse() {
     #OPTIND是全局变量，会影响到其他模块的getopts
     #每次通过getopts处理完选项后都要unset掉
     unset OPTIND
-}
-
-
-cmd() {
-    CMDLIST="$CMDLIST
-$@"
-}
-
-
-alive() {
-    local host="$1"
-    local ping_cmd=""
-    #local temp_file_success="${TEMP_DIR}/${host}.success"
-    local temp_file_failed="${TEMP_DIR}/${host}.failed"
-
-    if which fping &>/dev/null; then
-        ping_cmd="$(which fping)"
-    else
-        ping_cmd="$(which ping) -c 4 -q"
-    fi
-
-    $ping_cmd $host >/dev/null 2>"$temp_file_failed"
-    local rc="$?"
-    if [[ "$rc" -eq 0 ]]; then
-        success "$host | success | rc=0"
-    else
-        failed "$host | failed | rc=${rc} >>\n$(cat $temp_file_failed)"
-    fi
+    
+    #为了命令行-i参数和默认的全局变量SSH_TIMEOUT都能生效，所以放在这里
+    SSH_ARGS="$SSH_ARGS -o ConnectTimeout=${SSH_TIMEOUT}"
 }
 
 
@@ -317,31 +583,27 @@ main() {
     cmdline_arguments_parse "$@"
     #解析hosts文件
     hostfile_parse
-    #创建临时目录
-    create_temp_dir
+    #创建本地临时目录
+    create_local_temp_dir
 
-    if [[ -n "$MODULE" ]]; then
-        #alive和scp_file都是本地执行的，属于特例
-        if [[ "$MODULE" == "alive" || "$MODULE" == "scp_file" ]]; then
-            parall_run "$MODULE"
-            exit
-        else
-            $MODULE $MODULE_ARGS
+    #记录开始执行时间到日志文件
+    echo "=== $DATE ===" >> "$LOG_FILE"
+
+    if [[ -n "$BATCH_FILE" ]]; then
+        if [[ ! -f "$BATCH_FILE" ]]; then
+            error "$BATCH_FILE does not exist!"
         fi
-    elif [[ -z "$MODULE" && -n "$MODULE_ARGS" ]]; then
-        #如果不提供-m但是提供-a参数，则默认使用cmd模块
-        cmd "$MODULE_ARGS"
-    elif [[ -n "$BATCH_FILE" ]]; then
+        #执行脚本
         . "$BATCH_FILE"
+    elif [[ -n "$MODULE" ]]; then
+        $MODULE $MODULE_ARGS
+    elif [[ -z "$MODULE" && -n "$MODULE_ARGS" ]]; then
+        #如果不提供-m但是提供-a参数，则默认使用command模块
+        command "$MODULE_ARGS"
     else
         failed "nothing to do"
         usage
     fi
-
-    #远程主机执行的命令列表不能为空
-    [[ "${#CMDLIST}" -le 15 ]] && error "no command found"
-    #并发执行命令
-    parall_run
 }
 
 
